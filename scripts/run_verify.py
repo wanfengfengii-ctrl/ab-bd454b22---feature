@@ -13,7 +13,11 @@ It exits 0 only when *all* of the following pass; otherwise non-zero:
    c. replaying the same snapshotId/parameters returns the identical
       snapshot (idempotent), while different parameters conflict;
    d. a controller that keeps changing revisions yields a *stable*
-      conflict and leaves no queryable evidence.
+      conflict and leaves no queryable evidence;
+   e. firmware-upgrade compatibility checks: an all-approved change set is
+      compatible, a forbidden set/clear bit is pinpointed exactly, and a
+      misaligned window / rule tiling yields a stable rejection with no
+      partial verdict.
 """
 from __future__ import annotations
 
@@ -52,6 +56,27 @@ def ctrl_fault(mode: str, n: int = 1, skip: int = 0) -> None:
         json={"mode": mode, "n": n, "skip": skip},
         timeout=5,
     ).raise_for_status()
+
+
+def ctrl_set(device: str, addr: int, value: int) -> None:
+    httpx.post(
+        f"{CONTROLLER}/control/devices/{device}/set",
+        json={"addr": addr, "value": value},
+        timeout=5,
+    ).raise_for_status()
+
+
+def sealed_snapshot(http: httpx.Client, sid: str, device: str,
+                    values: list[int], start: int = 0) -> dict:
+    """Freeze ``values`` into the simulator, then seal a snapshot of them."""
+    for i, value in enumerate(values):
+        ctrl_set(device, start + i, value)
+    r = http.post(f"{GATEWAY}/api/snapshots", json={
+        "snapshotId": sid, "deviceId": device,
+        "startAddr": start, "count": len(values),
+    })
+    r.raise_for_status()
+    return r.json()
 
 
 # ------------------------------------------------------------ stages
@@ -182,6 +207,132 @@ def stage_smoke() -> None:
         report("continuous revision churn -> stable 409, no evidence",
                okd, f"status={rd.status_code}/{rd2.status_code}")
         ctrl_fault("none", n=0)
+
+        # (e) firmware-upgrade compatibility checks -----------------
+
+        # (e1) allowed change: every flipped bit is covered by the masks.
+        dev_e = "smoke-compat"
+        bid = f"smoke-compat-base-{uuid.uuid4()}"
+        cid = f"smoke-compat-cand-{uuid.uuid4()}"
+        base_vals = [0x0000, 0x0007, 0x1234, 0xFFFF]
+        cand_vals = [0x0005, 0x0003, 0x1234, 0xFFFF]
+        sealed_snapshot(http, bid, dev_e, base_vals)
+        sealed_snapshot(http, cid, dev_e, cand_vals)
+        re1 = http.post(f"{GATEWAY}/api/snapshots/compatibility", json={
+            "baselineSnapshotId": bid, "candidateSnapshotId": cid,
+            "startAddr": 0, "count": 4,
+            "rules": [
+                {"startAddr": 0, "endAddr": 1,
+                 "setAllowed": "0x0005", "clearAllowed": "0x0004"},
+                {"startAddr": 2, "endAddr": 3,
+                 "setAllowed": "0x0000", "clearAllowed": "0x0000"},
+            ],
+        })
+        body = re1.json() if re1.status_code == 200 else {}
+        changes = body.get("changes", [])
+        oke = (re1.status_code == 200 and body.get("compatible") is True
+               and [c["addr"] for c in changes] == [0, 1]
+               and all(int(c["violations"], 16) == 0 for c in changes))
+        report("compatibility: approved set/clear bits -> compatible",
+               oke, f"status={re1.status_code}")
+
+        # (e2) direction violation: an ordinary allowed numeric change must
+        # not mask the forbidden bit; exact masks/violations are returned.
+        cid2 = f"smoke-compat-bad-{uuid.uuid4()}"
+        sealed_snapshot(http, cid2, dev_e,
+                        [0x0011, 0x0003, 0x1234, 0xFFFF])
+        re2 = http.post(f"{GATEWAY}/api/snapshots/compatibility", json={
+            "baselineSnapshotId": bid, "candidateSnapshotId": cid2,
+            "startAddr": 0, "count": 4,
+            "rules": [
+                {"startAddr": 0, "endAddr": 0,
+                 "setAllowed": "0x0010", "clearAllowed": "0x0000"},
+                {"startAddr": 1, "endAddr": 1,
+                 "setAllowed": "0x0000", "clearAllowed": "0x0002"},
+                {"startAddr": 2, "endAddr": 3,
+                 "setAllowed": "0x0000", "clearAllowed": "0x0000"},
+            ],
+        })
+        body2 = re2.json() if re2.status_code == 200 else {}
+        by_addr = {c["addr"]: c for c in body2.get("changes", [])}
+        oke2 = (
+            re2.status_code == 200
+            and body2.get("compatible") is False
+            and by_addr.get(0, {}).get("setMask") == "0x0011"
+            and by_addr.get(0, {}).get("unauthorizedSet") == "0x0001"
+            and by_addr.get(1, {}).get("clearMask") == "0x0004"
+            and by_addr.get(1, {}).get("unauthorizedClear") == "0x0004"
+        )
+        report("compatibility: forbidden bits are pinpointed exactly",
+               oke2, f"status={re2.status_code}")
+
+        # (e3) misaligned window: snapshots cover 4 registers; asking for 6
+        # must fail stably with no partial verdict.
+        re3 = http.post(f"{GATEWAY}/api/snapshots/compatibility", json={
+            "baselineSnapshotId": bid, "candidateSnapshotId": cid,
+            "startAddr": 0, "count": 6,
+            "rules": [{"startAddr": 0, "endAddr": 5,
+                       "setAllowed": "0xFFFF", "clearAllowed": "0xFFFF"}],
+        })
+        oke3 = (re3.status_code == 422
+                and re3.json().get("error") == "insufficient_coverage"
+                and "compatible" not in re3.json())
+        report("compatibility: uncovered window -> stable 422, no verdict",
+               oke3, f"status={re3.status_code}")
+
+        # (e4) illegal rule tiling: overlap and a gap are both rejected.
+        re_overlap = http.post(f"{GATEWAY}/api/snapshots/compatibility", json={
+            "baselineSnapshotId": bid, "candidateSnapshotId": cid,
+            "startAddr": 0, "count": 4,
+            "rules": [
+                {"startAddr": 0, "endAddr": 2,
+                 "setAllowed": "0xFFFF", "clearAllowed": "0xFFFF"},
+                {"startAddr": 2, "endAddr": 3,
+                 "setAllowed": "0xFFFF", "clearAllowed": "0xFFFF"},
+            ],
+        })
+        re_gap = http.post(f"{GATEWAY}/api/snapshots/compatibility", json={
+            "baselineSnapshotId": bid, "candidateSnapshotId": cid,
+            "startAddr": 0, "count": 4,
+            "rules": [
+                {"startAddr": 0, "endAddr": 1,
+                 "setAllowed": "0xFFFF", "clearAllowed": "0xFFFF"},
+                {"startAddr": 3, "endAddr": 3,
+                 "setAllowed": "0xFFFF", "clearAllowed": "0xFFFF"},
+            ],
+        })
+        oke4 = (re_overlap.status_code == 400
+                and re_overlap.json().get("error") == "invalid_rule"
+                and re_gap.status_code == 400
+                and re_gap.json().get("error") == "invalid_rule")
+        report("compatibility: overlapping/gapped rules -> stable 400",
+               oke4,
+               f"status={re_overlap.status_code}/{re_gap.status_code}")
+
+        # (e5) cross-device and missing evidence are rejected, no verdict.
+        other = f"smoke-compat-other-{uuid.uuid4()}"
+        sealed_snapshot(http, other, "smoke-compat-other-device", [0] * 4)
+        re_dev = http.post(f"{GATEWAY}/api/snapshots/compatibility", json={
+            "baselineSnapshotId": bid, "candidateSnapshotId": other,
+            "startAddr": 0, "count": 4,
+            "rules": [{"startAddr": 0, "endAddr": 3,
+                       "setAllowed": "0xFFFF", "clearAllowed": "0xFFFF"}],
+        })
+        re_missing = http.post(f"{GATEWAY}/api/snapshots/compatibility", json={
+            "baselineSnapshotId": bid,
+            "candidateSnapshotId": f"no-such-snapshot-{uuid.uuid4()}",
+            "startAddr": 0, "count": 4,
+            "rules": [{"startAddr": 0, "endAddr": 3,
+                       "setAllowed": "0xFFFF", "clearAllowed": "0xFFFF"}],
+        })
+        oke5 = (re_dev.status_code == 409
+                and re_dev.json().get("error") == "device_mismatch"
+                and re_missing.status_code == 404
+                and re_missing.json().get("error") == "snapshot_not_found"
+                and "compatible" not in re_dev.json())
+        report("compatibility: cross-device/missing evidence -> stable error",
+               oke5,
+               f"status={re_dev.status_code}/{re_missing.status_code}")
 
 
 def _wait_healthy(http: httpx.Client) -> None:

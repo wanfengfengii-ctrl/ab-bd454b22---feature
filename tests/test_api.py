@@ -243,3 +243,196 @@ def test_concurrent_different_params_same_id_conflict(client):
     t2.join()
 
     assert sorted(outcomes) == [201, 409]
+
+
+# --------------------------------------------------- compatibility checks
+
+
+def _set_reg(base, device, addr, value):
+    return _ctrl(base, f"devices/{device}/set", {"addr": addr, "value": value})
+
+
+def _make_pair(client, device, baseline_values, candidate_values,
+               start=0, count=None):
+    """Create a baseline snapshot, mutate registers, then a candidate."""
+    c, base = client
+    count = len(baseline_values) if count is None else count
+    for i, v in enumerate(baseline_values):
+        assert _set_reg(base, device, start + i, v).status_code == 200
+    bid = f"{device}-base"
+    r = c.post("/api/snapshots", json={
+        "snapshotId": bid, "deviceId": device,
+        "startAddr": start, "count": count})
+    assert r.status_code == 201, r.text
+    for i, v in enumerate(candidate_values):
+        assert _set_reg(base, device, start + i, v).status_code == 200
+    cid = f"{device}-cand"
+    r = c.post("/api/snapshots", json={
+        "snapshotId": cid, "deviceId": device,
+        "startAddr": start, "count": count})
+    assert r.status_code == 201, r.text
+    return bid, cid
+
+
+def _compat(client, body):
+    c, _ = client
+    return c.post("/api/snapshots/compatibility", json=body)
+
+
+def test_compatibility_accepts_only_approved_directions(client):
+    bid, cid = _make_pair(
+        client, "buoy-c1",
+        [0x0000, 0x0003, 0xAAAA],
+        [0x0001, 0x0002, 0xAAAA],
+    )
+    # addr0 may set bit0; addr1 may clear bit0; addr2 unchanged.
+    r = _compat(client, {
+        "baselineSnapshotId": bid, "candidateSnapshotId": cid,
+        "startAddr": 0, "count": 3,
+        "rules": [{"startAddr": 0, "endAddr": 1,
+                   "setAllowed": "0x0001", "clearAllowed": "0x0001"},
+                  {"startAddr": 2, "endAddr": 2,
+                   "setAllowed": "0x0000", "clearAllowed": "0x0000"}],
+    })
+    assert r.status_code == 200, r.text
+    body = r.json()
+    assert body["compatible"] is True
+    assert {ch["addr"] for ch in body["changes"]} == {0, 1}
+    assert all(int(ch["violations"], 16) == 0 for ch in body["changes"])
+
+
+def test_compatibility_pinpoints_unauthorized_bits(client):
+    bid, cid = _make_pair(
+        client, "buoy-c2", [0x0000, 0x000F], [0x0011, 0x0000]
+    )
+    r = _compat(client, {
+        "baselineSnapshotId": bid, "candidateSnapshotId": cid,
+        "startAddr": 0, "count": 2,
+        "rules": [{"startAddr": 0, "endAddr": 0,
+                   "setAllowed": "0x0010", "clearAllowed": "0x0000"},
+                  {"startAddr": 1, "endAddr": 1,
+                   "setAllowed": "0x0000", "clearAllowed": "0x000E"}],
+    })
+    assert r.status_code == 200, r.text
+    body = r.json()
+    assert body["compatible"] is False
+    by_addr = {ch["addr"]: ch for ch in body["changes"]}
+    # addr0: allowed bit4 plus forbidden bit0 set; the numeric difference
+    # must not hide the forbidden one.
+    assert by_addr[0]["setMask"] == "0x0011"
+    assert by_addr[0]["unauthorizedSet"] == "0x0001"
+    # addr1: bit0 clear is forbidden (only bits 1..3 allowed to clear).
+    assert by_addr[1]["clearMask"] == "0x000F"
+    assert by_addr[1]["unauthorizedClear"] == "0x0001"
+    assert [ch["addr"] for ch in body["changes"]] == [0, 1]
+
+
+def test_compatibility_missing_snapshot_is_404_without_verdict(client):
+    c, _ = client
+    r = c.post("/api/snapshots", json={
+        "snapshotId": "comp-base", "deviceId": "buoy-c3",
+        "startAddr": 0, "count": 4})
+    assert r.status_code == 201
+    r = _compat(client, {
+        "baselineSnapshotId": "comp-base", "candidateSnapshotId": "ghost",
+        "startAddr": 0, "count": 4,
+        "rules": [{"startAddr": 0, "endAddr": 3,
+                   "setAllowed": "0xFFFF", "clearAllowed": "0xFFFF"}]})
+    assert r.status_code == 404
+    assert r.json()["error"] == "snapshot_not_found"
+    assert "changes" not in r.json() and "compatible" not in r.json()
+
+
+def test_compatibility_different_devices_conflict(client):
+    c, _ = client
+    for sid, dev in (("comp-d1", "buoy-d1"), ("comp-d2", "buoy-d2")):
+        r = c.post("/api/snapshots", json={
+            "snapshotId": sid, "deviceId": dev,
+            "startAddr": 0, "count": 4})
+        assert r.status_code == 201
+    r = _compat(client, {
+        "baselineSnapshotId": "comp-d1", "candidateSnapshotId": "comp-d2",
+        "startAddr": 0, "count": 4,
+        "rules": [{"startAddr": 0, "endAddr": 3,
+                   "setAllowed": "0xFFFF", "clearAllowed": "0xFFFF"}]})
+    assert r.status_code == 409
+    assert r.json()["error"] == "device_mismatch"
+    assert "compatible" not in r.json()
+
+
+def test_compatibility_insufficient_coverage_is_422(client):
+    bid, _ = _make_pair(client, "buoy-c4", [0] * 10, [0] * 10)
+    # Snapshot only holds 10 registers; the window asks for 12.
+    r = _compat(client, {
+        "baselineSnapshotId": bid, "candidateSnapshotId": bid,
+        "startAddr": 0, "count": 12,
+        "rules": [{"startAddr": 0, "endAddr": 11,
+                   "setAllowed": "0xFFFF", "clearAllowed": "0xFFFF"}]})
+    assert r.status_code == 422
+    assert r.json()["error"] == "insufficient_coverage"
+
+
+def test_compatibility_misaligned_rules_are_400(client):
+    bid, cid = _make_pair(client, "buoy-c5", [0] * 4, [0] * 4)
+    base_body = {
+        "baselineSnapshotId": bid, "candidateSnapshotId": cid,
+        "startAddr": 0, "count": 4}
+    # gap: rule ends early, last address uncovered
+    r = _compat(client, dict(base_body, rules=[
+        {"startAddr": 0, "endAddr": 2,
+         "setAllowed": "0xFFFF", "clearAllowed": "0xFFFF"}]))
+    assert r.status_code == 400 and r.json()["error"] == "invalid_rule"
+    # overlap between two segments
+    r = _compat(client, dict(base_body, rules=[
+        {"startAddr": 0, "endAddr": 2,
+         "setAllowed": "0xFFFF", "clearAllowed": "0xFFFF"},
+        {"startAddr": 2, "endAddr": 3,
+         "setAllowed": "0xFFFF", "clearAllowed": "0xFFFF"}]))
+    assert r.status_code == 400 and "overlap" in r.json()["reason"]
+    # rule reaches outside the checked window
+    r = _compat(client, dict(base_body, rules=[
+        {"startAddr": 0, "endAddr": 4,
+         "setAllowed": "0xFFFF", "clearAllowed": "0xFFFF"}]))
+    assert r.status_code == 400 and r.json()["error"] == "rule_outside_window"
+
+
+def test_compatibility_request_shape_validation(client):
+    r = _compat(client, {
+        "baselineSnapshotId": "a", "candidateSnapshotId": "b",
+        "startAddr": 0, "count": 2,
+        "rules": []})
+    assert r.status_code == 422
+    r = _compat(client, {
+        "baselineSnapshotId": "a", "candidateSnapshotId": "b",
+        "startAddr": 0, "count": 1,
+        "rules": [{"startAddr": 0, "endAddr": 0,
+                   "setAllowed": 0x10000, "clearAllowed": 0}]})
+    assert r.status_code == 422
+    r = _compat(client, {
+        "baselineSnapshotId": "a", "candidateSnapshotId": "b",
+        "startAddr": 0, "count": 1,
+        "rules": [{"startAddr": 0, "endAddr": 0,
+                   "setAllowed": "0xGGGG", "clearAllowed": 0}]})
+    assert r.status_code == 422
+
+
+def test_compatibility_against_failed_snapshot_is_not_found(client):
+    c, base = client
+    _ctrl(base, "fault", {"mode": "short_page", "n": 100, "skip": 1})
+    r = c.post("/api/snapshots", json={
+        "snapshotId": "comp-failed", "deviceId": "buoy-c6",
+        "startAddr": 0, "count": 100})
+    assert r.status_code == 502
+    _ctrl(base, "fault", {"mode": "none", "n": 0})
+    r = c.post("/api/snapshots", json={
+        "snapshotId": "comp-ok", "deviceId": "buoy-c6",
+        "startAddr": 0, "count": 4})
+    assert r.status_code == 201
+    r = _compat(client, {
+        "baselineSnapshotId": "comp-failed",
+        "candidateSnapshotId": "comp-ok",
+        "startAddr": 0, "count": 4,
+        "rules": [{"startAddr": 0, "endAddr": 3,
+                   "setAllowed": "0xFFFF", "clearAllowed": "0xFFFF"}]})
+    assert r.status_code == 404
+    assert r.json()["error"] == "snapshot_not_found"

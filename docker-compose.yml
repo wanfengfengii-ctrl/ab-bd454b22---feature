@@ -40,8 +40,8 @@ services:
       start_period: 4s
 
   # One-off verification: runs build check, unit tests and smoke tests
-  # (stable read / revision-change retry / idempotent replay), then exits
-  # with a non-zero code if anything failed.
+  # (stable read / revision-change retry / idempotent replay / firmware
+  # compatibility checks), then exits with a non-zero code on any failure.
   verify:
     image: buoy-snapshot:latest
     build: .

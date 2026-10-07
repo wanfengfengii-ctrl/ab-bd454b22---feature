@@ -79,6 +79,60 @@ GET /api/snapshots/{snapshotId}
 
 只有**完整、单一修订版**的快照可查；失败或不存在返回 `404`。
 
+### 固件升级位向兼容性核对
+
+```
+POST /api/snapshots/compatibility
+{
+  "baselineSnapshotId": "cal-before-upgrade",
+  "candidateSnapshotId": "cal-after-upgrade",
+  "startAddr": 0,
+  "count": 16,
+  "rules": [
+    {"startAddr": 0,  "endAddr": 7,
+     "setAllowed": "0x00FF", "clearAllowed": "0x0000"},
+    {"startAddr": 8,  "endAddr": 15,
+     "setAllowed": "0xFFFF", "clearAllowed": "0xFFFF"}
+  ]
+}
+```
+
+- 两份快照必须都已完整封存、属于**同一设备**，且其覆盖区间都完整包含
+  核对窗口 `[startAddr, startAddr+count)`。
+- `rules` 为 1–64 段掩码规则，按**绝对地址**给出闭区间
+  `[startAddr, endAddr]`，互不重叠且**恰好铺满**核对窗口。
+  `setAllowed`/`clearAllowed` 为 16 位掩码，接受整数或 `"0x…"` 十六进制
+  字符串；同一位置两位掩码可同时置位（允许双向变化）。
+- 任一快照不存在（或为失败记录）→ `404 snapshot_not_found`；
+  设备不一致 → `409 device_mismatch`；窗口未被完整覆盖 →
+  `422 insufficient_coverage`；规则越界/重叠/缺口/掩码非法 →
+  `400 invalid_rule`（或 `rule_outside_window`）。非法请求**不产生任何
+  部分裁决**。
+
+合法请求按绝对地址升序返回每个实际发生变化的寄存器，含基线/候选值、
+实际置位 `setMask`、实际清零 `clearMask`、越权置位/清零掩码及合并的
+`violations`，并给出整体 `compatible` 裁决——普通数值差异不会掩盖
+禁止置位或清零的位：
+
+```json
+{
+  "baselineSnapshotId": "...", "candidateSnapshotId": "...",
+  "deviceId": "buoy-alpha",
+  "revision": {"baseline": 12, "candidate": 13},
+  "window": {"startAddr": 0, "endAddr": 15, "count": 16},
+  "rules": [{"startAddr": 0, "endAddr": 7,
+             "setAllowed": "0x00FF", "clearAllowed": "0x0000"}],
+  "changes": [
+    {"addr": 3, "baseline": "0x0000", "candidate": "0x0101",
+     "setMask": "0x0101", "clearMask": "0x0000",
+     "unauthorizedSet": "0x0100", "unauthorizedClear": "0x0000",
+     "violations": "0x0100",
+     "rule": {"startAddr": 0, "endAddr": 7, "...": "..."}}
+  ],
+  "compatible": false
+}
+```
+
 ## 模拟器控制接口（测试用）
 
 ```
@@ -98,9 +152,10 @@ app/config.py            环境变量配置（控制器地址、页大小、超�
 app/controller_client.py 单页读取与严格校验（409/400/缺页/u16/地址回显）
 app/snapshot_service.py  分页循环、整轮丢弃重试、大端 SHA-256、终态持久化
 app/storage.py           SQLite 终态存储 + 唯一约束 + inflight 并发合并
+app/compatibility.py     位向掩码规则校验与快照比对（置位/清零/越权位）
 app/main.py              FastAPI 网关
 app/simulator.py         可控浮标控制器模拟器
-tests/                   31 个单元/API 测试
+tests/                   单元/API 测试（快照协议与兼容性核对）
 scripts/run_verify.py    verify 一次性服务入口
 ```
 
