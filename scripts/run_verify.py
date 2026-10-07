@@ -13,7 +13,12 @@ It exits 0 only when *all* of the following pass; otherwise non-zero:
    c. replaying the same snapshotId/parameters returns the identical
       snapshot (idempotent), while different parameters conflict;
    d. a controller that keeps changing revisions yields a *stable*
-      conflict and leaves no queryable evidence.
+      conflict and leaves no queryable evidence;
+   e. the compatibility endpoint accepts allowed register changes,
+      pinpoints every bit that violates the upgrade policy's direction
+      masks, and rejects misaligned rule windows, uncovered ranges,
+      missing snapshots and cross-device comparisons with stable
+      reasons and no partial verdict.
 """
 from __future__ import annotations
 
@@ -184,6 +189,140 @@ def stage_smoke() -> None:
         ctrl_fault("none", n=0)
 
 
+def stage_smoke_compatibility() -> None:
+    print("== compatibility smoke tests (live gateway + simulator) ==")
+    dev = f"smoke-compat-{uuid.uuid4().hex[:12]}"
+    with httpx.Client(timeout=30) as http:
+        _wait_healthy(http)
+
+        # Deterministic baseline register values on a fresh device.
+        baseline_vals = [0x0000, 0x0000, 0x0000, 0xFFFF] + [0x0000] * 12
+        for addr, val in enumerate(baseline_vals):
+            httpx.post(f"{CONTROLLER}/control/devices/{dev}/set",
+                       json={"addr": addr, "value": val},
+                       timeout=5).raise_for_status()
+
+        sid_base = f"smoke-compat-base-{uuid.uuid4()}"
+        rb = http.post(f"{GATEWAY}/api/snapshots", json={
+            "snapshotId": sid_base, "deviceId": dev,
+            "startAddr": 0, "count": 16,
+        })
+        ok = rb.status_code == 201 and rb.json().get("values") == baseline_vals
+        report("compatibility: baseline snapshot sealed", ok,
+               f"status={rb.status_code}")
+
+        # Firmware upgrade: addr 1 sets 0x00FF, addr 2 sets 0x0F00,
+        # addr 3 clears 0xFF00.
+        for addr, val in ((1, 0x00FF), (2, 0x0F00), (3, 0x00FF)):
+            httpx.post(f"{CONTROLLER}/control/devices/{dev}/set",
+                       json={"addr": addr, "value": val},
+                       timeout=5).raise_for_status()
+        sid_cand = f"smoke-compat-cand-{uuid.uuid4()}"
+        rc = http.post(f"{GATEWAY}/api/snapshots", json={
+            "snapshotId": sid_cand, "deviceId": dev,
+            "startAddr": 0, "count": 16,
+        })
+        ok = rc.status_code == 201
+        report("compatibility: candidate snapshot sealed", ok,
+               f"status={rc.status_code}")
+
+        def compat(**overrides):
+            body = {
+                "baselineId": sid_base, "candidateId": sid_cand,
+                "startAddr": 0, "count": 16,
+                "rules": [{"startAddr": 0, "count": 16,
+                           "allowSet": 0xFFFF, "allowClear": 0xFFFF}],
+            }
+            body.update(overrides)
+            return http.post(f"{GATEWAY}/api/snapshots/compatibility", json=body)
+
+        # (e1) every change inside the allowed masks -> compatible
+        r = compat()
+        ok = r.status_code == 200
+        body = r.json() if ok else {}
+        ok = ok and body.get("compatible") is True
+        ok = ok and body.get("changeCount") == 3
+        ok = ok and body.get("violationCount") == 0
+        ok = ok and [c["addr"] for c in body.get("changes", [])] == [1, 2, 3]
+        report("compatibility: allowed changes are compatible", ok,
+               f"status={r.status_code}")
+
+        # (e2) direction violations are located bit-exactly
+        strict = [
+            {"startAddr": 0, "count": 8,
+             "allowSet": 0x00FF, "allowClear": 0x0000},
+            {"startAddr": 8, "count": 8,
+             "allowSet": 0xFFFF, "allowClear": 0xFFFF},
+        ]
+        r = compat(rules=strict)
+        ok = r.status_code == 200
+        body = r.json() if ok else {}
+        by_addr = {c["addr"]: c for c in body.get("changes", [])}
+        ok = ok and body.get("compatible") is False
+        ok = ok and body.get("violationCount") == 2
+        ok = ok and by_addr.get(1, {}).get("unauthorizedSet") == 0
+        ok = ok and by_addr.get(2, {}).get("setMask") == 0x0F00
+        ok = ok and by_addr.get(2, {}).get("unauthorizedSet") == 0x0F00
+        ok = ok and by_addr.get(3, {}).get("clearMask") == 0xFF00
+        ok = ok and by_addr.get(3, {}).get("unauthorizedClear") == 0xFF00
+        report("compatibility: direction violations located per bit", ok,
+               f"status={r.status_code}")
+
+        # (e3) misaligned rule windows -> stable 400, no verdict
+        gap_rules = [
+            {"startAddr": 0, "count": 8, "allowSet": 0, "allowClear": 0},
+            {"startAddr": 9, "count": 7, "allowSet": 0, "allowClear": 0},
+        ]
+        r1 = compat(rules=gap_rules)
+        overlap_rules = [
+            {"startAddr": 0, "count": 9, "allowSet": 0, "allowClear": 0},
+            {"startAddr": 8, "count": 8, "allowSet": 0, "allowClear": 0},
+        ]
+        r2 = compat(rules=overlap_rules)
+        short_rules = [
+            {"startAddr": 0, "count": 15, "allowSet": 0, "allowClear": 0},
+        ]
+        r3 = compat(rules=short_rules)
+        ok = all(x.status_code == 400 for x in (r1, r2, r3))
+        ok = ok and all(x.json().get("error") == "invalid_rules"
+                        for x in (r1, r2, r3))
+        ok = ok and all("compatible" not in x.json() for x in (r1, r2, r3))
+        report("compatibility: misaligned rule window -> 400 invalid_rules",
+               ok, f"status={r1.status_code}/{r2.status_code}/{r3.status_code}")
+
+        # (e4) window outside the sealed snapshots -> stable 409
+        r = compat(startAddr=8, count=16, rules=[
+            {"startAddr": 8, "count": 16, "allowSet": 0, "allowClear": 0},
+        ])
+        ok = r.status_code == 409
+        ok = ok and r.json().get("error") == "range_not_covered"
+        ok = ok and "compatible" not in r.json()
+        report("compatibility: uncovered window -> 409 range_not_covered",
+               ok, f"status={r.status_code}")
+
+        # (e5) missing snapshot -> stable 404
+        r = compat(candidateId=f"smoke-compat-ghost-{uuid.uuid4()}")
+        ok = r.status_code == 404
+        ok = ok and r.json().get("error") == "snapshot_not_found"
+        ok = ok and "compatible" not in r.json()
+        report("compatibility: missing snapshot -> 404 snapshot_not_found",
+               ok, f"status={r.status_code}")
+
+        # (e6) snapshots of different devices -> stable 409
+        other_dev = f"{dev}-other"
+        sid_other = f"smoke-compat-other-{uuid.uuid4()}"
+        ro = http.post(f"{GATEWAY}/api/snapshots", json={
+            "snapshotId": sid_other, "deviceId": other_dev,
+            "startAddr": 0, "count": 16,
+        })
+        r = compat(candidateId=sid_other)
+        ok = ro.status_code == 201 and r.status_code == 409
+        ok = ok and r.json().get("error") == "device_mismatch"
+        ok = ok and "compatible" not in r.json()
+        report("compatibility: cross-device pair -> 409 device_mismatch",
+               ok, f"status={r.status_code}")
+
+
 def _wait_healthy(http: httpx.Client) -> None:
     for url in (f"{GATEWAY}/healthz", f"{CONTROLLER}/healthz"):
         for _ in range(50):
@@ -203,6 +342,7 @@ def main() -> int:
     stage_build()
     stage_unit_tests()
     stage_smoke()
+    stage_smoke_compatibility()
 
     print()
     if failures:

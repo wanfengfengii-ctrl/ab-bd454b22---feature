@@ -15,7 +15,7 @@ from fastapi import FastAPI
 from fastapi.responses import JSONResponse
 from pydantic import BaseModel, Field
 
-from . import config, snapshot_service, storage
+from . import compatibility, config, snapshot_service, storage
 from .storage import COMPLETE, FAILED, InflightRegistry
 
 
@@ -39,6 +39,25 @@ class SnapshotRequest(BaseModel):
     deviceId: str = Field(min_length=1, max_length=200)
     startAddr: int = Field(ge=0, le=0xFFFF)
     count: int = Field(ge=1, le=MAX_REGISTERS)
+
+
+class MaskRule(BaseModel):
+    """One policy segment: bits allowed to be set/cleared by the upgrade."""
+
+    startAddr: int = Field(ge=0, le=0xFFFF)
+    count: int = Field(ge=1, le=MAX_REGISTERS)
+    allowSet: int = Field(ge=0, le=0xFFFF)
+    allowClear: int = Field(ge=0, le=0xFFFF)
+
+
+class CompatibilityRequest(BaseModel):
+    baselineId: str = Field(min_length=1, max_length=200)
+    candidateId: str = Field(min_length=1, max_length=200)
+    startAddr: int = Field(ge=0, le=0xFFFF)
+    count: int = Field(ge=1, le=MAX_REGISTERS)
+    rules: list[MaskRule] = Field(
+        min_length=compatibility.MIN_RULES, max_length=compatibility.MAX_RULES
+    )
 
 
 def _evidence_response(row: dict[str, Any], replayed: bool) -> JSONResponse:
@@ -178,3 +197,93 @@ def get_snapshot(snapshot_id: str) -> JSONResponse:
                      "reason": "no complete snapshot exists for this snapshotId"},
         )
     return _evidence_response(row, replayed=True)
+
+
+def _compat_error(status: int, kind: str, reason: str) -> JSONResponse:
+    """A stable failure reason; never a partial verdict."""
+    return JSONResponse(
+        status_code=status, content={"error": kind, "reason": reason}
+    )
+
+
+@app.post("/api/snapshots/compatibility")
+def check_compatibility(req: CompatibilityRequest) -> JSONResponse:
+    """Verdict: did the upgrade only change register bits it was allowed to?
+
+    Checks, in a deterministic order (the first failure wins, so the
+    reason is stable): rule tiling, snapshot existence, same device,
+    window coverage. Only then is the bit-level comparison produced.
+    """
+    # 1. The mask rules must tile the checked window exactly.
+    try:
+        rules = compatibility.validate_rules(
+            req.startAddr,
+            req.count,
+            [
+                compatibility.Rule(r.startAddr, r.count, r.allowSet, r.allowClear)
+                for r in req.rules
+            ],
+        )
+    except compatibility.RuleError as exc:
+        return _compat_error(400, "invalid_rules", str(exc))
+
+    # 2. Both snapshots must exist as complete, single-revision evidence.
+    baseline = storage.get(req.baselineId)
+    if baseline is None or baseline["state"] != COMPLETE:
+        return _compat_error(
+            404, "snapshot_not_found",
+            f"no complete snapshot exists for baselineId {req.baselineId!r}",
+        )
+    candidate = storage.get(req.candidateId)
+    if candidate is None or candidate["state"] != COMPLETE:
+        return _compat_error(
+            404, "snapshot_not_found",
+            f"no complete snapshot exists for candidateId {req.candidateId!r}",
+        )
+
+    # 3. The two snapshots must describe the same device.
+    if baseline["device_id"] != candidate["device_id"]:
+        return _compat_error(
+            409, "device_mismatch",
+            f"baselineId belongs to device {baseline['device_id']!r} but "
+            f"candidateId belongs to device {candidate['device_id']!r}",
+        )
+
+    # 4. Both snapshots must fully cover the checked window.
+    end = req.startAddr + req.count
+    for label, row in (("baseline", baseline), ("candidate", candidate)):
+        row_end = row["start_addr"] + row["count"]
+        if req.startAddr < row["start_addr"] or end > row_end:
+            return _compat_error(
+                409, "range_not_covered",
+                f"{label} snapshot covers addresses "
+                f"[{row['start_addr']}, {row_end}) but the checked window "
+                f"[{req.startAddr}, {end}) extends outside it",
+            )
+
+    compatible, changes = compatibility.compare_window(
+        baseline["values"],
+        baseline["start_addr"],
+        candidate["values"],
+        candidate["start_addr"],
+        req.startAddr,
+        req.count,
+        rules,
+    )
+    return JSONResponse(
+        status_code=200,
+        content={
+            "baselineId": req.baselineId,
+            "candidateId": req.candidateId,
+            "deviceId": baseline["device_id"],
+            "startAddr": req.startAddr,
+            "count": req.count,
+            "compatible": compatible,
+            "changeCount": len(changes),
+            "violationCount": sum(
+                1 for c in changes
+                if c["unauthorizedSet"] or c["unauthorizedClear"]
+            ),
+            "changes": changes,
+        },
+    )

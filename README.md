@@ -79,6 +79,57 @@ GET /api/snapshots/{snapshotId}
 
 只有**完整、单一修订版**的快照可查；失败或不存在返回 `404`。
 
+### 固件升级兼容性核对
+
+```
+POST /api/snapshots/compatibility
+{
+  "baselineId": "fw-before",
+  "candidateId": "fw-after",
+  "startAddr": 0,
+  "count": 16,
+  "rules": [
+    {"startAddr": 0, "count": 8, "allowSet": 255,   "allowClear": 0},
+    {"startAddr": 8, "count": 8, "allowSet": 65535, "allowClear": 65535}
+  ]
+}
+```
+
+比较同一设备的两份已封存快照，判断固件升级是否只改动了获准方向的寄存器位：
+
+- `rules` 为 **1–64 段**十六位掩码规则，必须**无重叠、无空洞地恰好覆盖**
+  `[startAddr, startAddr+count)`（顺序任意）；`allowSet`/`allowClear` 分别
+  是该段内允许被置位/清零的位掩码（0–65535）。
+- 两份快照须属于**同一设备**且都**完整覆盖**核对区间。
+- 对每个发生变化的寄存器，按**绝对地址升序**返回实际置位掩码
+  `setMask`（`candidate & ~baseline`）、实际清零掩码 `clearMask`
+  （`baseline & ~candidate`），以及越权位 `unauthorizedSet` /
+  `unauthorizedClear`（实际变化中未被对应规则允许的部分）。
+
+`200` 响应体：
+
+```json
+{
+  "baselineId": "fw-before", "candidateId": "fw-after",
+  "deviceId": "buoy-alpha", "startAddr": 0, "count": 16,
+  "compatible": false, "changeCount": 3, "violationCount": 2,
+  "changes": [
+    {"addr": 2, "baseline": 0, "candidate": 3840,
+     "setMask": 3840, "clearMask": 0,
+     "unauthorizedSet": 3840, "unauthorizedClear": 0}
+  ]
+}
+```
+
+`compatible` 为整个区间的整体裁决：任一寄存器存在越权位即为 `false`。
+错误一律**不产生部分裁决**，原因稳定：
+
+- `400 invalid_rules` 规则未恰好覆盖区间（重叠/空洞/越界/段数超限）。
+- `404 snapshot_not_found` 基线或候选快照不存在或非完整证据。
+- `409 device_mismatch` 两份快照属于不同设备。
+- `409 range_not_covered` 某一快照未完整覆盖核对区间。
+- `422` 请求体不符合 schema（如掩码超过 16 位、规则数为 0 或超过 64）。
+
 ## 模拟器控制接口（测试用）
 
 ```
@@ -98,9 +149,10 @@ app/config.py            环境变量配置（控制器地址、页大小、超�
 app/controller_client.py 单页读取与严格校验（409/400/缺页/u16/地址回显）
 app/snapshot_service.py  分页循环、整轮丢弃重试、大端 SHA-256、终态持久化
 app/storage.py           SQLite 终态存储 + 唯一约束 + inflight 并发合并
+app/compatibility.py     升级策略核对：规则平铺校验、置位/清零与越权位计算
 app/main.py              FastAPI 网关
 app/simulator.py         可控浮标控制器模拟器
-tests/                   31 个单元/API 测试
+tests/                   62 个单元/API 测试
 scripts/run_verify.py    verify 一次性服务入口
 ```
 
