@@ -1,0 +1,60 @@
+services:
+  controller:
+    build: .
+    image: buoy-snapshot:latest
+    entrypoint: ["controller-entrypoint"]
+    environment:
+      CONTROLLER_PORT: "8080"
+      REGISTER_SPACE: "4096"
+    healthcheck:
+      test: ["CMD", "python", "-c", "import urllib.request,sys; sys.exit(0) if urllib.request.urlopen('http://localhost:8080/healthz', timeout=2).status==200 else sys.exit(1)"]
+      interval: 3s
+      timeout: 3s
+      retries: 10
+      start_period: 3s
+
+  gateway:
+    build: .
+    image: buoy-snapshot:latest
+    entrypoint: ["gateway-entrypoint"]
+    depends_on:
+      controller:
+        condition: service_healthy
+    environment:
+      CONTROLLER_URL: "http://controller:8080"
+      DB_PATH: "/data/snapshots.db"
+      GATEWAY_PORT: "8000"
+      PAGE_SIZE: "64"
+      MAX_ATTEMPTS: "3"
+      CONTROLLER_TIMEOUT: "2"
+    ports:
+      # Host-side port is configurable: GATEWAY_HOST_PORT=9090 docker compose up
+      - "${GATEWAY_HOST_PORT:-8000}:8000"
+    volumes:
+      - gateway-data:/data
+    healthcheck:
+      test: ["CMD", "python", "-c", "import urllib.request,sys; sys.exit(0) if urllib.request.urlopen('http://localhost:8000/healthz', timeout=2).status==200 else sys.exit(1)"]
+      interval: 3s
+      timeout: 3s
+      retries: 10
+      start_period: 4s
+
+  # One-off verification: runs build check, unit tests and smoke tests
+  # (stable read / revision-change retry / idempotent replay), then exits
+  # with a non-zero code if anything failed.
+  verify:
+    image: buoy-snapshot:latest
+    build: .
+    entrypoint: ["python", "/srv/scripts/run_verify.py"]
+    depends_on:
+      gateway:
+        condition: service_healthy
+      controller:
+        condition: service_healthy
+    environment:
+      GATEWAY_URL: "http://gateway:8000"
+      CONTROLLER_URL: "http://controller:8080"
+    restart: "no"
+
+volumes:
+  gateway-data:
